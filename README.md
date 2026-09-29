@@ -141,3 +141,22 @@ The full command keeps 30 stochastic repetitions and the configured budgets;
 use a separate output path for smaller pilots. See the
 [Stage 3 guide](experiments/stage3/README.md) and the generated manifest for
 coverage and resolved settings.
+
+## Stage 4: in-match dynamics with warm starts
+
+`football/dynamics.py` builds one network per match window (15-minute windows,
+or the periods between a team's substitutions) and solves uniform-source PPR in
+each window twice: cold-started from σ, and warm-started from the previous
+window's answer (players matched by label, newcomers given 1/n, renormalized).
+It records iterations, start errors, the observed convergence rate ρ, and the
+predicted saving `log(e_cold / e_warm) / log(1/ρ)`.
+
+```bash
+.venv/bin/python experiments/stage4/run_all.py --quick   # 5 matches
+.venv/bin/python experiments/stage4/run_all.py           # all 50 selected matches
+```
+
+Outputs in `results/stage4/`: `dynamic_windows.csv` (one row per window),
+`dynamic_vectors.csv` (exact PPR per window), `warm_start_summary.csv`, and
+`figures/` (warm vs cold iterations, predicted vs observed saving, influence
+timelines for the first match). Stage 4 reads raw StatsBomb data from `data/`.
