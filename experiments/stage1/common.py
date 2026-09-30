@@ -2,6 +2,16 @@
 
 Every experiment writes a CSV (the table view of each figure) and a PNG to
 ``results/stage1/``. Ground-truth vectors are cached in ``results/cache/``.
+
+The module is split into four parts:
+
+* configuration: paths, damping factors and per-dataset budgets;
+* data helpers: graphs, query sources and cached ground truth;
+* plotting: the shared palette, method styles and figure/CSV writers;
+* evaluation: the budget guard and the averaged trial runner.
+
+Stages 2-4 import the palette and ``mpl`` from here, so those names are part
+of the public interface and must stay stable.
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 import pprlib as pl  # noqa: E402
 from pprlib import datasets  # noqa: E402
 
+# ------------------------------------------------------------ configuration
 RESULTS = ROOT / "results" / "stage1"
 CACHE = ROOT / "results" / "cache"
 RESULTS.mkdir(parents=True, exist_ok=True)
@@ -42,8 +53,21 @@ DATASETS = {
 }
 QUICK = ["email-Eu-core", "ca-GrQc"]
 
+# Budget used for a dataset that is not listed in DATASETS (e.g. "toy").
+DEFAULT_BUDGET = dict(queries=3, trials=5, large=False)
+
+# The two query types every experiment covers.
+SOURCE_KINDS = ("ssq", "prc")
+SOURCE_LABELS = {"ssq": "single-source", "prc": "PageRank centrality"}
+
 
 def parse_args(description: str, default_alphas=ALPHAS):
+    """Parse the command-line options shared by every stage-1 experiment.
+
+    When ``--datasets`` is not given, the dataset list is QUICK under
+    ``--quick``, and otherwise every dataset (minus the large ones under
+    ``--no-large``).
+    """
     ap = argparse.ArgumentParser(description=description)
     ap.add_argument("--datasets", nargs="+", default=None, help="subset of: " + ", ".join(DATASETS))
     ap.add_argument("--alphas", nargs="+", type=float, default=list(default_alphas))
@@ -52,22 +76,28 @@ def parse_args(description: str, default_alphas=ALPHAS):
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     if args.datasets is None:
-        args.datasets = QUICK if args.quick else [
-            d for d in DATASETS if not (args.no_large and DATASETS[d]["large"])
-        ]
+        args.datasets = QUICK if args.quick else default_datasets(args.no_large)
     return args
 
 
+def default_datasets(no_large: bool) -> list[str]:
+    """Every configured dataset, without the large ones if ``no_large`` is set."""
+    return [d for d in DATASETS if not (no_large and DATASETS[d]["large"])]
+
+
 def budget(name: str, quick: bool) -> dict:
-    b = dict(DATASETS.get(name, dict(queries=3, trials=5, large=False)))
+    """Query and trial budget for ``name``; ``quick`` caps queries at 3 and quarters the trials."""
+    b = dict(DATASETS.get(name, DEFAULT_BUDGET))
     if quick:
         b["queries"] = min(b["queries"], 3)
         b["trials"] = max(2, b["trials"] // 4)
     return b
 
 
+# ------------------------------------------------------------ data helpers
 @lru_cache(maxsize=None)
 def graph(name: str) -> pl.Graph:
+    """Load a graph by name ("toy" is the paper's example graph); loaded once per process."""
     if name == "toy":
         return datasets.paper_toy_graph()
     return datasets.load_snap(name)
@@ -89,10 +119,14 @@ def sources(g: pl.Graph, kind: str, queries: np.ndarray) -> list[tuple[str, np.n
     raise ValueError(kind)
 
 
+def source_label(kind: str) -> str:
+    """Human-readable name of a source kind, as used in figure titles."""
+    return SOURCE_LABELS[kind]
+
+
 def ground_truth(name: str, g: pl.Graph, sigma: np.ndarray, alpha: float) -> np.ndarray:
     """Exact PPR (direct solve or 1e-15 power iteration), cached on disk."""
-    key = hashlib.sha1(sigma.tobytes()).hexdigest()[:12]
-    path = CACHE / f"{name}_a{alpha}_{key}.npy"
+    path = _cache_path(name, sigma, alpha)
     if path.exists():
         return np.load(path)
     pi = pl.exact_ppr(g, sigma, alpha, method="auto", tol=1e-15)
@@ -100,20 +134,19 @@ def ground_truth(name: str, g: pl.Graph, sigma: np.ndarray, alpha: float) -> np.
     return pi
 
 
+def _cache_path(name: str, sigma: np.ndarray, alpha: float) -> Path:
+    """Cache file for one (dataset, alpha, sigma) ground truth, keyed by a hash of sigma."""
+    key = hashlib.sha1(sigma.tobytes()).hexdigest()[:12]
+    return CACHE / f"{name}_a{alpha}_{key}.npy"
+
+
 def nlogn(n: int) -> int:
+    """ceil(n ln n), the paper's default number of random walks."""
     return math.ceil(n * math.log(n))
 
 
-class Timer:
-    def __enter__(self):
-        self.t0 = time.perf_counter()
-        return self
-
-    def __exit__(self, *exc):
-        self.s = time.perf_counter() - self.t0
-
-
 def log(msg: str):
+    """Print a timestamped progress message and flush it straight away."""
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
@@ -130,6 +163,11 @@ INK = "#0b0b0b"
 INK_2 = "#52514e"
 GRID = "#e4e3df"
 SURFACE = "#fcfcfb"
+REFERENCE = "#aaa9a4"     # theory / reference lines drawn behind the data
+FLOOR_SHADE = "#f0efec"   # background band marking the float64 round-off floor
+
+# Ordinal blue ramp (validated steps 250..650) used for ordered alpha values.
+ALPHA_RAMP = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 
 METHOD_STYLE = {
     "power": dict(color=INK_2, marker="s", label="Power method"),
@@ -140,60 +178,83 @@ METHOD_STYLE = {
     "pf": dict(color=PALETTE["magenta"], marker="P", label="PF"),
     "ppf": dict(color=PALETTE["violet"], marker="X", label="PPF"),
 }
-for base in ("mcf", "pf", "ppf"):
-    s = dict(METHOD_STYLE[base])
-    s["label"] = s["label"] + "V"
-    s["linestyle"] = "--"
-    s["mfc"] = SURFACE
-    METHOD_STYLE[base + "v"] = s
+
+
+def _add_variant_styles():
+    """Register the dashed, hollow-marker "V" style for each spanning-forest method."""
+    for base in ("mcf", "pf", "ppf"):
+        s = dict(METHOD_STYLE[base])
+        s["label"] = s["label"] + "V"
+        s["linestyle"] = "--"
+        s["mfc"] = SURFACE
+        METHOD_STYLE[base + "v"] = s
+
+
+_add_variant_styles()
+
+# Order in which methods appear in figure legends.
+LEGEND_ORDER = ("power", "mcw", "pw", "ppw", "mcf", "pf", "ppf", "mcfv", "pfv", "ppfv")
+
+RC_PARAMS = {
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "axes.edgecolor": GRID, "axes.labelcolor": INK, "text.color": INK,
+    "xtick.color": INK_2, "ytick.color": INK_2, "axes.grid": True,
+    "grid.color": GRID, "grid.linewidth": 0.8, "grid.linestyle": "-",
+    "axes.spines.top": False, "axes.spines.right": False,
+    "lines.linewidth": 2.0, "lines.markersize": 6, "lines.markeredgewidth": 1.2,
+    "font.size": 10, "axes.titlesize": 11, "legend.frameon": False, "legend.fontsize": 9,
+    "figure.dpi": 110, "savefig.dpi": 160,
+}
 
 
 def mpl():
+    """Return ``matplotlib.pyplot`` on the headless Agg backend with the shared style applied."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams.update({
-        "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
-        "axes.edgecolor": GRID, "axes.labelcolor": INK, "text.color": INK,
-        "xtick.color": INK_2, "ytick.color": INK_2, "axes.grid": True,
-        "grid.color": GRID, "grid.linewidth": 0.8, "grid.linestyle": "-",
-        "axes.spines.top": False, "axes.spines.right": False,
-        "lines.linewidth": 2.0, "lines.markersize": 6, "lines.markeredgewidth": 1.2,
-        "font.size": 10, "axes.titlesize": 11, "legend.frameon": False, "legend.fontsize": 9,
-        "figure.dpi": 110, "savefig.dpi": 160,
-    })
+    plt.rcParams.update(RC_PARAMS)
     return plt
 
 
 def method_line(ax, x, y, method, **kw):
+    """Plot one method's curve in its fixed style; ``kw`` overrides the style."""
     st = dict(METHOD_STYLE[method])
     st.update(kw)
     st.setdefault("markeredgecolor", st["color"])
     return ax.plot(x, y, **st)
 
 
+def method_legend(fig, seen: dict, order=LEGEND_ORDER):
+    """One shared legend below the figure, with the methods in ``seen`` listed in ``order``."""
+    shown = [m for m in order if m in seen]
+    fig.legend([seen[m] for m in shown], [seen[m].get_label() for m in shown], loc="lower center",
+               ncol=len(shown), bbox_to_anchor=(0.5, -0.01))
+
+
 def alpha_colors(alphas):
     """Ordinal blue ramp (validated steps 250..650) for ordered alpha values."""
-    ramp = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
-    idx = np.linspace(0, len(ramp) - 1, len(alphas)).round().astype(int)
-    return [ramp[i] for i in idx]
+    idx = np.linspace(0, len(ALPHA_RAMP) - 1, len(alphas)).round().astype(int)
+    return [ALPHA_RAMP[i] for i in idx]
 
 
 def save_fig(fig, name: str):
+    """Write ``fig`` to results/stage1/<name>.png."""
     path = RESULTS / f"{name}.png"
     fig.savefig(path, bbox_inches="tight")
     log(f"wrote {path.relative_to(ROOT)}")
 
 
 def save_csv(df, name: str):
+    """Write ``df`` to results/stage1/<name>.csv without the index."""
     path = RESULTS / f"{name}.csv"
     df.to_csv(path, index=False)
     log(f"wrote {path.relative_to(ROOT)}")
 
 
 def paper_alpha_label(alpha: float) -> str:
+    """Legend label showing both conventions, e.g. "α=0.8 (paper α=0.2)"."""
     return f"α={alpha:g} (paper α={1 - alpha:.2g})"
 
 
@@ -205,6 +266,7 @@ MAX_STEPS = 4e8
 
 
 def too_expensive(n_walks: float, alpha: float, limit: float = MAX_STEPS) -> bool:
+    """True when ``n_walks`` walks of expected length 1/(1-alpha) exceed ``limit`` steps."""
     return n_walks / (1.0 - alpha) > limit
 
 
@@ -213,13 +275,17 @@ def evaluate(name, g, alpha, kind, queries, method, trials, seed=0, *, eps=None,
     from pprlib import evaluation
 
     rows = []
-    for tag, sigma in sources(g, kind, queries):
+    for _tag, sigma in sources(g, kind, queries):
         pi = ground_truth(name, g, sigma, alpha)
         res = evaluation.run_trials(
             lambda r: pl.compute_ppr(g, sigma, alpha, method, rng=r, **params), trials, seed)
         rows.append(evaluation.summarize(res, pi, k=10, mu=1.0 / g.n, eps=eps))
-    keys = rows[0].keys()
-    out = {k: float(np.mean([r[k] for r in rows])) for k in keys}
+    return _average_rows(rows)
+
+
+def _average_rows(rows: list[dict]) -> dict:
+    """Mean of each summary field over sources, plus the worst max_rel and the source count."""
+    out = {k: float(np.mean([r[k] for r in rows])) for k in rows[0].keys()}
     out["max_rel_worst"] = float(np.max([r.get("max_rel", np.nan) for r in rows]))
     out["n_sources"] = len(rows)
     return out

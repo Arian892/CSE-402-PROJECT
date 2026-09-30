@@ -12,7 +12,10 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent # path resolve
+# Directory holding the experiment scripts; each one is run from here so `import common` works.
+HERE = Path(__file__).resolve().parent
+
+# Experiments in the order they are run.
 EXPERIMENTS = [
     "e1_power_convergence.py",
     "e2_variance_validation.py",
@@ -21,12 +24,18 @@ EXPERIMENTS = [
     "e5_parameters.py",
     "e6_walk_vs_forest.py",
     "e7_relative_error.py",
-] # all the experiments
+]
+
+
+def run_experiment(exp: str, extra: list[str]):
+    """Run one experiment script in a subprocess, stopping on failure, and report its wall time."""
+    t0 = time.time()
+    print(f"\n===== {exp} {' '.join(extra)} =====", flush=True)
+    subprocess.run([sys.executable, str(HERE / exp), *extra], check=True, cwd=HERE)
+    print(f"===== {exp} finished in {time.time() - t0:.0f}s =====", flush=True)
+
 
 if __name__ == "__main__":
     extra = sys.argv[1:]
     for exp in EXPERIMENTS:
-        t0 = time.time()
-        print(f"\n===== {exp} {' '.join(extra)} =====", flush=True)
-        subprocess.run([sys.executable, str(HERE / exp), *extra], check=True, cwd=HERE)
-        print(f"===== {exp} finished in {time.time() - t0:.0f}s =====", flush=True)
+        run_experiment(exp, extra)
