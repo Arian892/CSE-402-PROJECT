@@ -15,12 +15,25 @@ import numpy as np
 import pandas as pd
 
 from common import (
-    budget, evaluate, graph, log, method_line, mpl, nlogn, paper_alpha_label,
-    parse_args, query_nodes, save_csv, save_fig, too_expensive,
+    REFERENCE, SOURCE_KINDS, budget, evaluate, graph, log, method_line, mpl, nlogn,
+    paper_alpha_label, parse_args, query_nodes, save_csv, save_fig, source_label, too_expensive,
 )
 from pprlib import theory
 
 EPS = (0.5, 0.4, 0.3, 0.2, 0.1)
+
+# PPW batch count used for the guarantee.
+PPW_BATCHES = 3
+
+
+def method_configs(g, alpha, eps) -> dict:
+    """Theory-driven parameters of each method for target relative error ``eps``."""
+    return {
+        "mcw": dict(n_walks=theory.mcw_walks_for_guarantee(g.n, eps)),
+        "pw": dict(n_walks=nlogn(g.n), K=theory.theoretical_K(alpha, eps)),
+        "ppw": dict(n_walks=nlogn(g.n), K=theory.theoretical_K(alpha, eps / np.sqrt(PPW_BATCHES)),
+                    n_batches=PPW_BATCHES),
+    }
 
 
 def run(args):
@@ -31,14 +44,9 @@ def run(args):
         qs = query_nodes(g, b["queries"], args.seed)
         trials = max(2, b["trials"] // 4)
         for alpha in args.alphas:
-            for kind in ("ssq", "prc"):
+            for kind in SOURCE_KINDS:
                 for eps in EPS:
-                    configs = {
-                        "mcw": dict(n_walks=theory.mcw_walks_for_guarantee(g.n, eps)),
-                        "pw": dict(n_walks=nlogn(g.n), K=theory.theoretical_K(alpha, eps)),
-                        "ppw": dict(n_walks=nlogn(g.n), K=theory.theoretical_K(alpha, eps / np.sqrt(3)), n_batches=3),
-                    }
-                    for m, kw in configs.items():
+                    for m, kw in method_configs(g, alpha, eps).items():
                         if too_expensive(kw["n_walks"], alpha):
                             log(f"skip {name} alpha={alpha} {m} eps={eps}: T={kw['n_walks']:,} (budget guard)")
                             continue
@@ -55,9 +63,10 @@ def run(args):
 
 
 def plot(df):
+    """Per source kind: time, L1 error and worst relative error vs eps, one column per (dataset, alpha)."""
     plt = mpl()
     combos = list(dict.fromkeys(zip(df.dataset, df.alpha)))
-    for kind in ("ssq", "prc"):
+    for kind in SOURCE_KINDS:
         fig, axes = plt.subplots(3, len(combos), figsize=(3.9 * len(combos), 9), squeeze=False)
         seen = {}
         for j, (name, alpha) in enumerate(combos):
@@ -69,23 +78,28 @@ def plot(df):
                 method_line(axes[2, j], dm.eps, dm.max_rel_worst, m)
                 seen.setdefault(m, ln)
             e = np.array(sorted(df.eps.unique()))
-            axes[2, j].plot(e, e, color="#aaa9a4", linewidth=1, linestyle=":", label="max_rel = ε (guarantee)")
-            for i in range(3):
-                axes[i, j].set_yscale("log")
-                axes[i, j].invert_xaxis() if not axes[i, j].xaxis_inverted() else None
+            axes[2, j].plot(e, e, color=REFERENCE, linewidth=1, linestyle=":", label="max_rel = ε (guarantee)")
+            for ax in axes[:, j]:
+                ax.set_yscale("log")
+                # Larger eps on the left; guard against inverting an axis twice.
+                if not ax.xaxis_inverted():
+                    ax.invert_xaxis()
             axes[0, j].set_title(f"{name} · {paper_alpha_label(alpha)}", fontsize=9)
             axes[2, j].set_xlabel("target relative error ε")
         axes[0, 0].set_ylabel("time per query (s)")
         axes[1, 0].set_ylabel("mean L1 error")
         axes[2, 0].set_ylabel("worst relative error (π ≥ 1/n)")
-        order = [m for m in ("mcw", "pw", "ppw") if m in seen]
-        h = [seen[m] for m in order] + [axes[2, 0].lines[-1]]
-        fig.legend(h, [x.get_label() for x in h], loc="lower center", ncol=len(h), bbox_to_anchor=(0.5, -0.01))
-        what = "single-source" if kind == "ssq" else "PageRank centrality"
-        fig.suptitle(f"E7 · Relative-error guarantee, {what}: points below the dotted line meet the guarantee",
-                     x=0.01, ha="left")
+        guarantee_legend(fig, seen, axes[2, 0].lines[-1])
+        fig.suptitle(f"E7 · Relative-error guarantee, {source_label(kind)}: "
+                     "points below the dotted line meet the guarantee", x=0.01, ha="left")
         fig.tight_layout(rect=(0, 0.035, 1, 1))
         save_fig(fig, f"e7_relative_error_{kind}")
+
+
+def guarantee_legend(fig, seen, guarantee_line):
+    """Shared legend: the methods, then the dotted guarantee line."""
+    h = [seen[m] for m in ("mcw", "pw", "ppw") if m in seen] + [guarantee_line]
+    fig.legend(h, [x.get_label() for x in h], loc="lower center", ncol=len(h), bbox_to_anchor=(0.5, -0.01))
 
 
 if __name__ == "__main__":

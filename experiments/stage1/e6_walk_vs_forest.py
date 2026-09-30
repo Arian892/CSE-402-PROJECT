@@ -26,6 +26,37 @@ from common import (
 import pprlib as pl
 from pprlib import evaluation, theory
 
+# Columns of the printed Table 2 reproduction (l1_forest_deg is added when present).
+TABLE_COLUMNS = ["dataset", "paper_alpha", "n_pi2", "n_tau_walk_over_tau_forest", "n_r", "l1_walk", "l1_forest"]
+
+
+def estimators(g, sigma, alpha, T, F):
+    """Estimator name -> function of an rng; the degree variant only on undirected graphs."""
+    est = {
+        "walk": lambda r: pl.mcw(g, sigma, alpha, T, r),
+        "forest": lambda r: pl.mcf(g, sigma, alpha, F, r),
+    }
+    if g.is_undirected():
+        est["forest_deg"] = lambda r: pl.mcf(g, sigma, alpha, F, r, variant="degree")
+    return est
+
+
+def predicted_mse(row, g, fs, pi2, T, F):
+    """Add the Lemma 4.4 equal-time MSE predictions to ``row``."""
+    row["pred_mse_walk"] = (1 - pi2) / T
+    row["pred_mse_forest"] = (fs["n_r"] / g.n - pi2) / F
+    if g.is_undirected():
+        row["pred_mse_forest_deg"] = (fs["n_rd"] / g.n - pi2) / F
+
+
+def measure(row, est, pi, trials, seed):
+    """Add the measured L1 error, MSE and time of every estimator to ``row``."""
+    for key, fn in est.items():
+        res = evaluation.run_trials(fn, trials, seed)
+        row[f"l1_{key}"] = float(np.mean([pl.metrics.l1_error(x.estimate, pi) for x in res]))
+        row[f"mse_{key}"] = evaluation.mean_squared_error(res, pi)
+        row[f"time_{key}"] = float(np.mean([x.time for x in res]))
+
 
 def run(args):
     rows = []
@@ -46,21 +77,8 @@ def run(args):
             row = dict(dataset=name, alpha=alpha, paper_alpha=round(1 - alpha, 3), n=g.n, T=T, F=F,
                        n_pi2=g.n * pi2, n_tau_walk_over_tau_forest=g.n * tw / fs["tau_forest"],
                        n_r=fs["n_r"], n_rd=fs["n_rd"] if g.is_undirected() else np.nan)
-            row["pred_mse_walk"] = (1 - pi2) / T
-            row["pred_mse_forest"] = (fs["n_r"] / g.n - pi2) / F
-            if g.is_undirected():
-                row["pred_mse_forest_deg"] = (fs["n_rd"] / g.n - pi2) / F
-            est = {
-                "walk": lambda r: pl.mcw(g, sigma, alpha, T, r),
-                "forest": lambda r: pl.mcf(g, sigma, alpha, F, r),
-            }
-            if g.is_undirected():
-                est["forest_deg"] = lambda r: pl.mcf(g, sigma, alpha, F, r, variant="degree")
-            for key, fn in est.items():
-                res = evaluation.run_trials(fn, trials, args.seed)
-                row[f"l1_{key}"] = float(np.mean([pl.metrics.l1_error(x.estimate, pi) for x in res]))
-                row[f"mse_{key}"] = evaluation.mean_squared_error(res, pi)
-                row[f"time_{key}"] = float(np.mean([x.time for x in res]))
+            predicted_mse(row, g, fs, pi2, T, F)
+            measure(row, estimators(g, sigma, alpha, T, F), pi, trials, args.seed)
             row["lemma44_predicts_forest_better"] = bool(row["pred_mse_forest"] < row["pred_mse_walk"])
             row["observed_forest_better"] = bool(row["mse_forest"] < row["mse_walk"])
             rows.append(row)
@@ -69,12 +87,16 @@ def run(args):
                 + (f" forestV={row['l1_forest_deg']:.4f}" if g.is_undirected() else ""))
     df = pd.DataFrame(rows)
     save_csv(df, "e6_walk_vs_forest")
-    cols = ["dataset", "paper_alpha", "n_pi2", "n_tau_walk_over_tau_forest", "n_r", "l1_walk", "l1_forest"]
-    cols += [c for c in ("l1_forest_deg",) if c in df]
+    report(df)
+    return df
+
+
+def report(df):
+    """Log the Table 2 reproduction and how often Lemma 4.4 picked the right winner."""
+    cols = TABLE_COLUMNS + [c for c in ("l1_forest_deg",) if c in df]
     log("Table 2 reproduction:\n" + df[cols].to_string(index=False, float_format="%.3g"))
     agree = (df.lemma44_predicts_forest_better == df.observed_forest_better).mean()
     log(f"Lemma 4.4 prediction agrees with the measurement in {agree:.0%} of cases")
-    return df
 
 
 if __name__ == "__main__":
