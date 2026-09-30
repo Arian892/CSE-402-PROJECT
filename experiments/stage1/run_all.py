@@ -2,7 +2,7 @@
 
     python run_all.py            # full run (all datasets incl. com-youtube; about 1-2 h)
     python run_all.py --quick    # small datasets, fewer trials (about 10 min)
-    python run_all.py --no-large # everything except com-youtube
+    python run_all.py --no-large # everything except com-youtube (about 30 min)
 
 Extra arguments are passed on to every experiment. Output goes to results/stage1/.
 """
@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent # path resolve
 EXPERIMENTS = [
     "e1_power_convergence.py",
     "e2_variance_validation.py",
@@ -21,7 +21,7 @@ EXPERIMENTS = [
     "e5_parameters.py",
     "e6_walk_vs_forest.py",
     "e7_relative_error.py",
-]
+] # all the experiments
 
 if __name__ == "__main__":
     extra = sys.argv[1:]
